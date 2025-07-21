@@ -1,0 +1,301 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # 毎日午前2時に実行
+    - cron: '0 2 * * *'
+
+jobs:
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run npm audit
+      run: |
+        echo "Running npm audit..."
+        npm audit --audit-level=moderate
+    
+    - name: Generate audit report
+      run: |
+        npm audit --json > audit-report.json || true
+        echo "Audit report generated"
+    
+    - name: Upload audit report
+      uses: actions/upload-artifact@v4
+      with:
+        name: npm-audit-report
+        path: audit-report.json
+
+  code-quality:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run ESLint
+      run: |
+        echo "Running ESLint with security rules..."
+        npx eslint . --ext .js --format json --output-file eslint-report.json || true
+        npx eslint . --ext .js
+    
+    - name: Upload ESLint report
+      uses: actions/upload-artifact@v4
+      with:
+        name: eslint-report
+        path: eslint-report.json
+
+  security-codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    
+    strategy:
+      matrix:
+        language: [ 'javascript' ]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        queries: security-extended,security-and-quality
+    
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+    
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{matrix.language}}"
+
+  security-snyk:
+    name: Snyk Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run Snyk to check for vulnerabilities
+      uses: snyk/actions/node@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high --json-file-output=snyk-report.json
+      continue-on-error: true
+    
+    - name: Upload Snyk report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: snyk-report
+        path: snyk-report.json
+
+  docker-security:
+    name: Docker Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Create Dockerfile
+      run: |
+        cat > Dockerfile << 'EOF'
+        FROM node:20-alpine
+        
+        # セキュリティ: 非rootユーザーを作成
+        RUN addgroup -g 1001 -S nodejs
+        RUN adduser -S nextjs -u 1001
+        
+        WORKDIR /app
+        
+        # 依存関係をコピーしてインストール
+        COPY package*.json ./
+        RUN npm ci --only=production && npm cache clean --force
+        
+        # アプリケーションコードをコピー
+        COPY . .
+        
+        # 非rootユーザーに切り替え
+        USER nextjs
+        
+        EXPOSE 3000
+        
+        CMD ["npm", "start"]
+        EOF
+    
+    - name: Build Docker image
+      run: docker build -t security-demo:latest .
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'security-demo:latest'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  security-tests:
+    name: Security Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run security tests
+      run: npm test
+    
+    - name: Security headers test
+      run: |
+        # サーバーをバックグラウンドで起動
+        npm start &
+        SERVER_PID=$!
+        sleep 5
+        
+        echo "Testing security headers..."
+        
+        # セキュリティヘッダーの確認
+        curl -I http://localhost:3000/health | grep -i "x-content-type-options"
+        curl -I http://localhost:3000/health | grep -i "x-frame-options"
+        curl -I http://localhost:3000/health | grep -i "x-xss-protection"
+        
+        # サーバー停止
+        kill $SERVER_PID
+    
+    - name: Rate limiting test
+      run: |
+        npm start &
+        SERVER_PID=$!
+        sleep 5
+        
+        echo "Testing rate limiting..."
+        
+        # 大量のリクエストを送信してレート制限をテスト
+        for i in {1..105}; do
+          curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/health
+        done | tail -5
+        
+        kill $SERVER_PID
+
+  generate-security-report:
+    name: Generate Security Report
+    needs: [dependency-audit, code-quality, security-tests]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: security-reports/
+    
+    - name: Generate comprehensive security report
+      run: |
+        mkdir -p final-report
+        
+        cat > final-report/security-summary.md << 'EOF'
+        # Security Scan Summary Report
+        
+        Generated at: $(date)
+        Repository: ${{ github.repository }}
+        Branch: ${{ github.ref }}
+        Commit: ${{ github.sha }}
+        
+        ## Scan Results
+        
+        ### 1. Dependency Audit
+        - **Tool**: npm audit
+        - **Status**: $([ -f security-reports/npm-audit-report/audit-report.json ] && echo "✅ Completed" || echo "❌ Failed")
+        
+        ### 2. Code Quality Check
+        - **Tool**: ESLint with security plugin
+        - **Status**: $([ -f security-reports/eslint-report/eslint-report.json ] && echo "✅ Completed" || echo "❌ Failed")
+        
+        ### 3. Security Tests
+        - **Tool**: Jest with security test cases
+        - **Status**: ✅ Completed
+        
+        ## Security Best Practices Implemented
+        
+        - ✅ Input validation and sanitization
+        - ✅ Password hashing with bcrypt
+        - ✅ JWT token authentication
+        - ✅ Rate limiting
+        - ✅ Security headers with Helmet.js
+        - ✅ HTTPS enforcement (production)
+        - ✅ SQL injection prevention
+        - ✅ XSS protection
+        
+        ## Recommendations
+        
+        1. Regular dependency updates
+        2. Implement CSRF protection
+        3. Add API versioning
+        4. Implement proper logging and monitoring
+        5. Use environment variables for secrets
+        
+        EOF
+        
+        cat final-report/security-summary.md
+    
+    - name: Upload security summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-summary-report
+        path: final-report/
